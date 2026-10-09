@@ -1,0 +1,426 @@
+# PHASE 3 — WAREHOUSE OPTIMIZATION & INTELLIGENCE SPECIFICATION
+
+> [!IMPORTANT]
+> **Specification Version:** 1.0.0 (Design & Architecture Phase)  
+> **Target Scope:** Warehouse Graph Navigation, Dijkstra / A* Pathfinding, Deterministic Order Batching, Pick-Route Optimization, Service Boundary, Agent Tool Interface, and Performance Benchmark Methodology.  
+> **Strict Directive:** DESIGN ONLY. Zero database schema modifications, zero code execution, zero direct SQL generation from agents.
+
+---
+
+## 1. Executive Summary & Objectives
+
+Phase 3 introduces the **Warehouse Optimization & Intelligence** layer for the Smart Logistics Platform. It extends the Phase 1 domain models (`warehouses`, `warehouse_zones`, `warehouse_nodes`, `warehouse_edges`, `storage_locations`, `products`, `inventory`, `orders`, `order_items`, `batches`, `batch_orders`, `pick_routes`, `pick_route_steps`) and Phase 2 Core APIs to deliver deterministic indoor dark-store optimization.
+
+### Key Objectives:
+1. **Warehouse Graph Engine**: Model dark-store physical layouts as weighted graph structures supporting traversability, zone attributes, edge costs, and path reconstruction using Dijkstra and A* pathfinding.
+2. **Deterministic Order Batching Engine**: Group eligible pending orders into capacity-constrained, priority-aware, zone-aligned batches using explicit mathematical objective functions.
+3. **Pick-Route Optimization Engine**: Compute optimal node-by-node picking sequences for assigned order batches using TSP heuristics over the indoor graph.
+4. **Warehouse Optimization Service (`WarehouseOptimizationService`)**: Establish a clean service boundary that orchestrates graph loading, order eligibility checks, batching, route generation, and database persistence.
+5. **Warehouse Agent & Tool Interface**: Define a typed AI Agent abstraction (`WarehouseAgent`) equipped with 9 deterministic, tool-governed APIs. The agent provides explanations, constraint diagnostics, and workflow orchestration without executing raw SQL or mutating state directly.
+6. **Performance Benchmark Methodology**: Establish precise benchmark dimensions ($N=10, 100, 1000$ nodes; $M=10, 50, 100$ orders; $K=5, 20, 50$ pick locations) to evaluate latency, distance reduction, and batching efficiency against baseline approaches (FIFO, input-order picking).
+
+---
+
+## 2. Core Architecture & System Boundaries
+
+The Phase 3 architecture strictly enforces the **Deterministic-First Principle**. The AI Agent acts as an orchestrator and explainer; it does NOT calculate shortest paths or solve constraint batching directly.
+
+```mermaid
+graph TD
+    FE["React Frontend (UI)"] -->|HTTP /api/v1/warehouse/*| API["FastAPI API Routers"]
+    API -->|Delegates Request| SVC["WarehouseOptimizationService"]
+    
+    subgraph "Core Optimization Layer (Deterministic)"
+        SVC -->|1. Load Layout| GRAPH["Warehouse Graph Engine (NetworkX / Custom)"]
+        SVC -->|2. Form Batches| BATCH["Order Batching Engine (Heuristics / OR-Tools)"]
+        SVC -->|3. Route Sequence| ROUTE["Pick Route Engine (A* / TSP Solver)"]
+    end
+    
+    subgraph "AI Agent Orchestration & Explanation Layer"
+        SVC -->|Optional AI Request| AGENT["Warehouse Agent"]
+        AGENT -->|Invoke Approved Tools| TOOLS["Typed Agent Tool Interface (9 Tools)"]
+        TOOLS -->|Call Internal API| SVC
+        AGENT -->|Return Explanation & Diagnostics| SVC
+    end
+    
+    SVC -->|Persist Results| DB[(PostgreSQL Database)]
+```
+
+### Architectural Guardrails:
+* **No Direct Agent DB Access**: The agent cannot issue SQLAlchemy queries or SQL DML/DDL. All data reads occur via domain repositories; writes occur via service validation routines.
+* **Deterministic Fallback**: If an LLM or agent provider is offline or times out, the core optimization engines execute deterministically and template-based explanations are returned.
+
+---
+
+## 3. Existing Database Entity Mapping
+
+Phase 3 leverages the 12 existing PostgreSQL entities created in Phase 1 without structural schema changes:
+
+```mermaid
+erDiagram
+    warehouses ||--o{ warehouse_zones : contains
+    warehouses ||--o{ warehouse_nodes : has_nodes
+    warehouses ||--o{ warehouse_edges : connects
+    warehouse_nodes ||--o{ storage_locations : contains
+    storage_locations ||--o{ inventory : stores
+    products ||--o{ inventory : tracked_in
+    warehouses ||--o{ orders : receives
+    orders ||--|{ order_items : contains
+    products ||--o{ order_items : ordered_as
+    warehouses ||--o{ batches : groups
+    batches ||--|{ batch_orders : includes
+    orders ||--|| batch_orders : assigned_to
+    batches ||--o| pick_routes : generates
+    pick_routes ||--|{ pick_route_steps : contains
+    storage_locations ||--o{ pick_route_steps : targets
+```
+
+### Domain Field Usage Mapping:
+1. **`warehouse_nodes`**: `id`, `node_code`, `x_coord`, `y_coord`, `zone_id`. Represents graph vertices $V$.
+2. **`warehouse_edges`**: `from_node_id`, `to_node_id`, `distance_meters`. Represents directed weighted edges $E$.
+3. **`orders`**: `id`, `warehouse_id`, `priority` (1=normal, 2=high, 3=urgent), `status` (`pending`, `batched`), `promised_at`.
+4. **`products`**: `unit_weight_kg`, `unit_volume_cbm`. Used for batch capacity constraint checks.
+5. **`inventory`**: `warehouse_id`, `location_id`, `product_id`, `quantity`. Validates item availability.
+6. **`batches`**: `batch_code`, `assigned_picker_id`, `max_orders`, `total_weight_kg`, `status`.
+7. **`pick_routes`**: `batch_id`, `total_distance_meters`, `estimated_duration_minutes`, `algorithm_used`.
+8. **`pick_route_steps`**: `pick_route_id`, `step_number`, `location_id`, `product_id`, `quantity_to_pick`.
+
+---
+
+## 4. Warehouse Graph Engine & Pathfinding Algorithms
+
+### 4.1 Graph Abstraction Design
+The indoor dark-store floor is abstracted into an adjacency-list graph $G = (V, E, W)$:
+- **Vertices ($V$)**: Structural decision points, aisle intersections, zone boundaries, and storage location access points (`warehouse_nodes`).
+- **Edges ($E$)**: Walkable corridors connecting adjacent nodes (`warehouse_edges`).
+- **Weights ($W$)**: Physical Euclidean or Manhattan distance in meters (`distance_meters`).
+
+```python
+# Graph Engine Domain Classes (Conceptual)
+class WarehouseNode:
+    id: int
+    node_code: str
+    zone_id: int
+    x_coord: float
+    y_coord: float
+    is_blocked: bool = False
+
+class WarehouseEdge:
+    from_node_id: int
+    to_node_id: int
+    distance_meters: float
+    is_traversable: bool = True
+
+class WarehouseGraph:
+    nodes: Dict[int, WarehouseNode]
+    adjacency: Dict[int, List[Tuple[int, float]]]  # node_id -> [(neighbor_id, weight)]
+    
+    def load_from_db(self, warehouse_id: int, db: Session) -> None: ...
+    def get_shortest_path(self, start_id: int, goal_id: int, algorithm: str = "a_star") -> PathResult: ...
+```
+
+### 4.2 Pathfinding Algorithm Evaluation & Comparison
+
+| Parameter | Dijkstra's Algorithm | A* (A-Star) Algorithm |
+|---|---|---|
+| **Mechanism** | Uniform-cost search exploring nodes in order of path cost $g(n)$ | Heuristic-guided search exploring nodes by $f(n) = g(n) + h(n)$ |
+| **Heuristic $h(n)$** | None ($h(n) = 0$) | Euclidean Distance $h(n) = \sqrt{(x_2-x_1)^2 + (y_2-y_1)^2}$ |
+| **Time Complexity** | $O((\|E\| + \|V\|) \log \|V\|)$ using Fibonacci/Binary Min-Heap | $O((\|E\| + \|V\|) \log \|V\|)$ worst-case; $O(\|E\|)$ with tight heuristic |
+| **Memory Complexity** | $O(\|V\|)$ to store open/closed node states | $O(\|V\|)$ to store priority queue and distance maps |
+| **Optimality** | Guaranteed optimal for all non-negative edge weights | Guaranteed optimal if $h(n)$ is admissible ($h(n) \le h^*(n)$) |
+| **Primary Use Case** | All-pairs shortest path matrix precomputation (Floyd-Warshall / Multi-source Dijkstra) | Single-source to single-destination point-to-point routing |
+
+> [!NOTE]
+> **Graph Policy**: Use **Dijkstra** for precomputing the $N \times N$ distance matrix between all storage locations during batch setup, and **A*** for dynamic point-to-point route evaluation when real-time obstacles or blocked edges are present.
+
+### 4.3 Pathfinding Execution Flow
+
+```mermaid
+flowchart TD
+    A[Request: Start Node A, End Node B] --> B{Node A & B Valid?}
+    B -- No --> C[Return Error: Invalid Node ID]
+    B -- Yes --> D{Are Nodes in Same Graph Component?}
+    D -- No/Unreachable --> E[Return Status: UNREACHABLE, Distance: Infinity]
+    D -- Yes --> F[Initialize Priority Queue Q with Start Node]
+    F --> G[Extract Node with Min f_score]
+    G --> H{Is Target Node B?}
+    H -- Yes --> I[Reconstruct Path via CameFrom Map]
+    H -- No --> J[Expand Neighbors & Evaluate Edge Traversability]
+    J --> K[Compute Tentative g_score & Heuristic h_score]
+    K --> G
+    I --> L[Return PathResult: Nodes, Distance Meters, Latency MS]
+```
+
+---
+
+## 5. Order Batching Engine Design
+
+### 5.1 Objective Function
+The Order Batching Engine clusters unassigned pending orders into picking batches to minimize total picker travel distance while respecting physical capacity and order priority SLAs.
+
+$$\text{Minimize } Z = w_1 \cdot \text{Distance}(B) + w_2 \cdot \text{ZoneOverlapPenalty}(B) + w_3 \cdot \text{PrioritySLAPenalty}(B)$$
+
+Where:
+- $\text{Distance}(B)$: Estimated walking distance to pick all items in batch $B$.
+- $\text{ZoneOverlapPenalty}(B)$: Penalty assigned when orders in a batch span multiple distant warehouse zones.
+- $\text{PrioritySLAPenalty}(B)$: Penalty assigned if high-priority (urgent) orders are delayed by grouping with low-priority orders.
+- $w_1 = 1.0, w_2 = 15.0, w_3 = 50.0$ (Configurable parameters).
+
+### 5.2 Constraints & Schema Enforcement
+1. **Max Orders per Batch**: $|B| \le \text{batch.max\_orders}$ (Default: 5).
+2. **Max Weight Capacity**: $\sum_{i \in B} \text{weight}(i) \le \text{MAX\_WEIGHT\_KG}$ (Default: 25.0 kg for human pickers).
+3. **Max Volume Capacity**: $\sum_{i \in B} \text{volume}(i) \le \text{MAX\_VOLUME\_CBM}$ (Default: 0.12 $m^3$).
+4. **Inventory Availability**: Every item in order $i \in B$ must have $\text{inventory.quantity} \ge \text{order\_item.quantity}$.
+
+### 5.3 Batching Strategy Comparison
+
+```mermaid
+graph LR
+    SubGraph1["Strategy 1: FIFO Baseline"] -->|Simple Arrival Order| B1["Fixed Capacity Batches"]
+    SubGraph2["Strategy 2: Zone-Based Grouping"] -->|Cluster by Zone_ID| B2["Single-Zone Batches"]
+    SubGraph3["Strategy 3: Priority-Constrained Greedy"] -->|Priority -> Distance Heuristic| B3["Optimized Batches"]
+```
+
+* **FIFO Baseline**: Group orders strictly by `created_at` timestamp until max batch size is reached. (Serves as baseline metric).
+* **Zone-Based Grouping**: Cluster orders whose items reside in identical `warehouse_zones` to prevent cross-zone traveling.
+* **Priority-Constrained Greedy (Recommended)**: Sort pending orders by `priority DESC, promised_at ASC`. For each order, find an active batch with minimum incremental distance increase without violating weight/volume bounds.
+
+---
+
+## 6. Pick Route Optimization Engine
+
+### 6.1 Problem Formulation (Indoor Traveling Salesperson Problem)
+Given a batch $B$ containing item set $I$, map each item to its storage location node $V_B \subseteq V$. The Pick Route Engine calculates a sequence $(v_0, v_1, v_2, \dots, v_k, v_0)$ where $v_0$ is the warehouse entrance/dispatch node, visiting all $v_i \in V_B$ with minimal total walking distance.
+
+### 6.2 Routing Heuristics & Baseline Comparison
+
+```mermaid
+flowchart LR
+    A[Batch Picking Locations] --> B1[Input Order Baseline]
+    A --> B2[Nearest Neighbor Heuristic]
+    A --> B3[2-Opt / TSP Solver over Graph Matrix]
+    
+    B1 --> C1[High Distance, Backtracking]
+    B2 --> C2[Medium Distance, Fast O-N^2]
+    B3 --> C3[Optimal Short Distance, Low Backtracking]
+```
+
+1. **Input Order Baseline**: Visit locations in the order items appear in the order payload.
+2. **Nearest Neighbor Heuristic**: Starting at entrance $v_0$, greedily visit the nearest unvisited pick location $v_{next}$ based on shortest graph distance $d(v_{current}, v_{next})$.
+3. **Graph-Based 2-Opt TSP Optimizer (Recommended)**: Precompute pairwise shortest-path matrix between all target nodes using A*/Dijkstra, then apply 2-Opt edge swapping to eliminate path crossings.
+
+---
+
+## 7. Warehouse Optimization Service Boundary (`WarehouseOptimizationService`)
+
+The `WarehouseOptimizationService` encapsulates all business logic, data validation, and algorithm execution.
+
+### Service Workflow & Data Pipeline
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Router as API Router
+    participant Service as WarehouseOptimizationService
+    participant Repo as DB Repository
+    participant Graph as Graph Engine
+    participant Batcher as Batching Engine
+    participant RouterEng as Route Engine
+    participant DB as PostgreSQL
+
+    Router->>Service: recommend_warehouse_optimization(warehouse_id, max_batches)
+    Service->>Repo: Fetch Warehouse, Nodes, Edges, Inventory
+    Service->>Graph: Build WarehouseGraph(V, E)
+    Service->>Repo: Fetch Pending Orders (status='pending')
+    Service->>Batcher: generate_batches(orders, inventory, max_capacity)
+    Batcher-->>Service: List[BatchCandidate]
+    loop For Each Batch
+        Service->>RouterEng: optimize_pick_route(batch, graph)
+        RouterEng-->>Service: PickRouteResult (distance, steps)
+    end
+    Service->>Service: Validate SLA & Constraint Metrics
+    Service->>DB: Persist Batches, BatchOrders, PickRoutes, PickRouteSteps (Transaction)
+    Service-->>Router: OptimizationSummaryResponse
+```
+
+---
+
+## 8. AI Agent Layer & Tool Interface
+
+### 8.1 Warehouse Agent Responsibilities & Rules
+The `WarehouseAgent` provides intelligent orchestration and natural-language diagnostic reasoning for warehouse managers.
+
+#### Allowed Responsibilities:
+- Inspect current pending orders and warehouse congestion.
+- Trigger optimization pipeline via domain tools.
+- Explain trade-offs in generated batches (e.g., why an urgent order was placed in a separate batch).
+- Recommend inventory re-positioning when high-demand items are stored in distant zones.
+
+#### Prohibited Actions:
+- ❌ Direct SQL execution or database schema mutation.
+- ❌ Overriding inventory balance records.
+- ❌ Fabricating non-existent graph nodes or locations.
+- ❌ Bypassing domain service validation checks.
+
+### 8.2 Agent Tool Contracts (9 Tools)
+
+```mermaid
+graph TD
+    Agent["Warehouse Agent"] --> T1["get_warehouse_graph"]
+    Agent --> T2["get_pending_orders"]
+    Agent --> T3["get_inventory_state"]
+    Agent --> T4["calculate_shortest_path"]
+    Agent --> T5["generate_order_batches"]
+    Agent --> T6["generate_pick_route"]
+    Agent --> T7["validate_batch"]
+    Agent --> T8["validate_pick_route"]
+    Agent --> T9["calculate_warehouse_metrics"]
+```
+
+#### Tool Interface Specification Table:
+
+| Tool Name | Input Schema | Output Schema | Auth Requirement | Failure Behavior |
+|---|---|---|---|---|
+| `get_warehouse_graph` | `warehouse_id: int` | `nodes: List, edges: List, total_nodes: int` | `admin`, `warehouse_operator` | Return 404 if warehouse invalid |
+| `get_pending_orders` | `warehouse_id: int, limit: int` | `orders: List[OrderRead], count: int` | `admin`, `warehouse_operator` | Return empty list |
+| `get_inventory_state` | `warehouse_id: int, product_ids: List[int]` | `stock_map: Dict[int, int]` | `admin`, `warehouse_operator` | Return stock count 0 |
+| `calculate_shortest_path` | `warehouse_id: int, start_node: int, goal_node: int` | `path: List[int], distance_meters: float` | `admin`, `warehouse_operator` | Return status UNREACHABLE |
+| `generate_order_batches` | `warehouse_id: int, max_orders_per_batch: int` | `batches: List[BatchPlan], unbatched: List[int]` | `admin`, `warehouse_operator` | Fallback to FIFO batching |
+| `generate_pick_route` | `batch_id: int, algorithm: str` | `route_steps: List[Step], total_distance: float` | `admin`, `warehouse_operator` | Fallback to Nearest Neighbor |
+| `validate_batch` | `order_ids: List[int], max_weight_kg: float` | `is_valid: bool, violations: List[str]` | `admin`, `warehouse_operator` | Return `is_valid=False` |
+| `validate_pick_route` | `route_steps: List[int]` | `is_valid: bool, unreachable_nodes: List[int]` | `admin`, `warehouse_operator` | Return `is_valid=False` |
+| `calculate_warehouse_metrics` | `warehouse_id: int` | `avg_distance: float, batch_efficiency: float` | `admin`, `warehouse_operator` | Return zeroed metrics |
+
+---
+
+## 9. Performance Benchmark Methodology
+
+To evaluate optimization efficiency quantitatively, benchmark scenarios are defined across three scaling dimensions.
+
+### 9.1 Benchmark Test Matrix
+
+```mermaid
+gantt
+    title Benchmark Execution Scale Matrix
+    dateFormat  X
+    axisFormat %s
+    section Graph Pathfinding
+    10 Nodes (Small Store)       :active, 0, 10
+    100 Nodes (Medium Store)     :active, 0, 100
+    1000 Nodes (Regional Hub)    :active, 0, 1000
+    section Order Batching
+    10 Pending Orders            :crit, 0, 10
+    50 Pending Orders            :crit, 0, 50
+    100 Pending Orders           :crit, 0, 100
+    section Pick Routing
+    5 Locations / Batch          :done, 0, 5
+    20 Locations / Batch         :done, 0, 20
+    50 Locations / Batch         :done, 0, 50
+```
+
+### 9.2 Measured Metrics:
+1. **Algorithmic Execution Time ($ms$)**: Time required to solve graph paths, batches, and pick routes.
+2. **Total Pick Distance ($m$)**: Cumulative meters walked to fulfill order batch.
+3. **Batch Count Efficiency**: Number of batches generated vs optimal theoretical minimum.
+4. **Distance Reduction Percentage ($\%$)**:
+
+$$\text{Improvement } (\%) = \frac{\text{Distance}_{\text{Baseline}} - \text{Distance}_{\text{Optimized}}}{\text{Distance}_{\text{Baseline}}} \times 100$$
+
+---
+
+## 10. API Specification & Endpoints
+
+All Phase 3 endpoints are exposed under `/api/v1/warehouse/` and require valid JWT authentication.
+
+```mermaid
+graph LR
+    API["/api/v1/warehouse"] --> E1["GET /graph"]
+    API --> E2["POST /shortest-path"]
+    API --> E3["POST /batch-recommendation"]
+    API --> E4["POST /pick-route-recommendation"]
+    API --> E5["POST /optimize"]
+    API --> E6["GET /metrics"]
+```
+
+### Endpoints Table:
+
+| Method | Endpoint | Role Allowed | Description |
+|---|---|---|---|
+| `GET` | `/api/v1/warehouse/:id/graph` | `admin`, `warehouse_operator`, `fleet_manager` | Fetch dark-store node/edge graph structure |
+| `POST` | `/api/v1/warehouse/shortest-path` | `admin`, `warehouse_operator` | Compute shortest path between two indoor nodes |
+| `POST` | `/api/v1/warehouse/batch-recommendation` | `admin`, `warehouse_operator` | Generate candidate order batching plan |
+| `POST` | `/api/v1/warehouse/pick-route-recommendation` | `admin`, `warehouse_operator` | Generate candidate pick route for a batch |
+| `POST` | `/api/v1/warehouse/optimize` | `admin`, `warehouse_operator` | Run end-to-end batching + routing + DB persistence |
+| `GET` | `/api/v1/warehouse/:id/metrics` | `admin`, `warehouse_operator`, `fleet_manager` | Fetch warehouse picking distance & efficiency KPIs |
+
+---
+
+## 11. Testing & Failure Recovery Strategy
+
+### 11.1 Test Matrix
+
+```mermaid
+mindmap
+  root((Phase 3 Test Suite))
+    Graph Tests
+      Valid path Dijkstra
+      Valid path A*
+      Unreachable node handling
+      Blocked edge bypass
+    Batching Tests
+      Empty pending orders
+      Weight limit overflow
+      Volume limit overflow
+      Priority SLA ordering
+      Inventory shortage handling
+    Picking Tests
+      Single location route
+      Multi-location 2-Opt route
+      Unreachable location detection
+    Agent Tests
+      Authorized tool invocation
+      Unauthorized role rejection
+      Malformed tool arguments
+      LLM fallback handling
+```
+
+### 11.2 Failure & Fallback Matrix
+
+| Failure Mode | Detection Mechanism | Immediate Fallback Action | Operational Impact |
+|---|---|---|---|
+| **PostgreSQL Unreachable** | SQLAlchemy `OperationalError` | Return 503 DB Unavailable error envelope | System halts safely; no corrupt writes |
+| **Unreachable Graph Node** | Dijkstra open-set empty | Mark step as `UNREACHABLE`; route around node | Picker notified to bypass location |
+| **Insufficient Inventory** | `inventory.quantity < required` | Exclude order from batching; create low-stock alert | Order delayed until replenishment |
+| **Optimization Timeout** | Thread timeout (>2.0 sec) | Abort 2-Opt solver; return Greedy Nearest-Neighbor route | Sub-optimal route returned within SLA |
+| **LLM Provider Offline** | Connection refusal / HTTP 5xx | Switch `WarehouseAgent` to deterministic template response | Explanations simplified; optimization unaffected |
+
+---
+
+## 12. Schema Gap & Open Decision Analysis
+
+> [!NOTE]
+> **Schema Assessment**: The Phase 1 database schema natively supports all Phase 3 requirements. No table alterations or DDL migrations are needed.
+
+### Minor Schema Observation (Non-Blocking):
+- `products.unit_volume_cbm` is stored as `Numeric(8,4)`. Volume-based batch capacity checks will use `float(product.unit_volume_cbm)`.
+- `warehouse_edges.distance_meters` is stored as `Numeric(8,2)`. Graph edge weights cast directly to `float`.
+
+---
+
+## 13. Recommended Implementation Sequence (Phase 3 Execution Plan)
+
+Upon user approval of this specification, implementation will proceed in 4 ordered sub-tasks:
+
+```mermaid
+gantt
+    title Phase 3 Implementation Execution Sequence
+    dateFormat  YYYY-MM-DD
+    section Step 1: Graph & Route Engines
+    Implement WarehouseGraph & A*/Dijkstra algorithms : active, 2026-09-23, 1d
+    section Step 2: Batching Engine
+    Implement Priority-Constrained Greedy Batcher   : 2026-09-24, 1d
+    section Step 3: Service & Tool Layer
+    Build WarehouseOptimizationService & 9 Tools     : 2026-09-25, 1d
+    section Step 4: APIs & Tests
+    Expose /api/v1/warehouse/ routes & Pytest suite  : 2026-09-26, 1d
+```

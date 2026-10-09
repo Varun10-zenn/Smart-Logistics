@@ -1,0 +1,5 @@
+sku,name,category,unit_weight_kg,unit_volume_cbm,price
+MILK-1L,Milk 1L,Grocery,1.0,0.001,60
+BREAD-400,Bread 400g,Grocery,0.4,0.002,45
+RICE-1KG,Rice 1kg,Grocery,1.0,0.0015,70
+EGGS-12,Eggs 12 pack,Grocery,0.8,0.002,90

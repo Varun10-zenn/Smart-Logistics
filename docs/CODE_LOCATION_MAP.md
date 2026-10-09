@@ -1,0 +1,20 @@
+# Smart Logistics Platform — Code Location Map
+
+Quick lookup reference mapping features to source code files across the repository stack.
+
+| Feature | Frontend Component | API Router | Pydantic Schema | Backend Service | Core Algorithm / File | SQLAlchemy Model | Database Tables | Test Files |
+| ------- | ------------------ | ---------- | --------------- | --------------- | --------------------- | ---------------- | --------------- | ---------- |
+| **Authentication & Auth** | `pages/LoginPage.tsx` | `api/v1/auth.py` | `schemas/auth.py` | `services/auth_service.py` | `core/security.py` | `models/user.py` | `users`, `roles` | `tests/test_auth.py` |
+| **Warehouse Dashboard** | `pages/WarehousePage.tsx` | `api/v1/warehouses.py` | `schemas/warehouse.py` | `services/warehouse_service.py` | `services/warehouse_service.py` | `models/warehouse.py` | `warehouses` | `tests/test_warehouses.py` |
+| **Warehouse Topology & Graph** | `components/WarehouseGraphCanvas.tsx` | `api/v1/warehouses.py` | `schemas/warehouse.py` | `services/warehouse_graph.py` | `services/warehouse_graph.py` (NetworkX) | `models/warehouse.py` | `warehouse_nodes`, `warehouse_edges` | `tests/test_warehouse_graph.py` |
+| **Order Management** | `components/OrderBatchList.tsx` | `api/v1/orders.py` | `schemas/order.py` | `services/order_service.py` | `services/order_service.py` | `models/order.py` | `orders`, `order_items` | `tests/test_orders.py` |
+| **Order Batch Optimization** | `pages/WarehousePage.tsx` | `api/v1/batches.py` | `schemas/batch.py` | `services/warehouse_optimization_service.py` | `services/order_batcher.py` (Priority Heuristic) | `models/batch.py` | `batches`, `batch_orders` | `tests/test_order_batcher.py` |
+| **Pick Route Optimization** | `components/PickRouteDetails.tsx` | `api/v1/picking.py` | `schemas/batch.py` | `services/warehouse_optimization_service.py` | `services/pick_routing_engine.py` (Dijkstra + 2-opt) | `models/batch.py` | `pick_routes`, `pick_route_steps` | `tests/test_pick_routing_engine.py` |
+| **Delivery Management** | `pages/DeliveriesPage.tsx` | `api/v1/deliveries.py` | `schemas/delivery.py` | `services/delivery_service.py` | `services/delivery_service.py` | `models/delivery.py` | `deliveries` | `tests/test_deliveries.py` |
+| **Delivery Routing & ETA** | `pages/DeliveryDetailPage.tsx` | `api/v1/deliveries.py` | `schemas/delivery.py` | `services/routing_service.py` | `services/routing_service.py` (OSRM / Haversine) | `models/delivery.py` | `deliveries` | `tests/test_routing.py` |
+| **Telemetry Ingestion** | N/A (API stream / External) | `api/v1/telemetry.py` | `schemas/telemetry.py` | `services/telemetry_service.py` | `services/telemetry_service.py` | `models/telemetry.py` | `telemetry_events` | `tests/test_telemetry.py` |
+| **Safety Event & Scoring** | `pages/SafetyPage.tsx` | `api/v1/safety.py` | `schemas/safety.py` | `services/safety_service.py` | `services/safety_service.py` (Threshold rules) | `models/safety.py` | `safety_events`, `safety_scores`, `safety_alerts` | `tests/test_safety.py` |
+| **EV Station & Slots** | `pages/ChargingPage.tsx` | `api/v1/charging.py` | `schemas/charging.py` | `services/charging_service.py` | `services/charging_service.py` | `models/charging.py` | `charging_stations`, `charging_slots` | `tests/test_charging.py` |
+| **EV Charging Recommendation**| `pages/ChargingOptimizePage.tsx` | `api/v1/charging.py` | `schemas/charging.py` | `services/ev_charging_optimization_service.py` | `services/ev_charging_optimization_service.py` | `models/charging.py` | Read-only charging tables | `tests/test_ev_charging.py` |
+| **EV Atomic Slot Reservation** | `pages/ChargingPage.tsx` | `api/v1/charging.py` | `schemas/charging.py` | `services/charging_service.py` | `SELECT FOR UPDATE` + Overlap validation | `models/charging.py` | `charging_reservations` | `tests/test_charging_concurrency.py` |
+| **AI / Intelligence Layer** | `pages/AIInsightsPage.tsx` | `api/v1/intelligence.py` | `schemas/intelligence.py` | `services/warehouse_agent.py` | `services/warehouse_agent_tools.py` | `models/intelligence.py` | `ai_recommendations` | `tests/test_warehouse_agent.py` |
